@@ -175,7 +175,7 @@ class ControlModule(torch.nn.Module):
                 pos = pos[0:1]
             elif pos.ndim == 3:
                 # mrope with batch dim: [batch, 3, seq_len] → [batch, seq_len]
-                pos = pos[:, 0, :]
+                pos = pos[0:1, 0, :]
     
             zero_indices = (pos == 0).cumsum(1).argmax(1, keepdim=True)
             seq_len = modified.shape[1]

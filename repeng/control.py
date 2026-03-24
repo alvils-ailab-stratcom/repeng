@@ -148,29 +148,35 @@ class ControlModule(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         output = self.block(*args, **kwargs)
-
         control = self.params.control
-
+    
         if control is None:
             return output
         elif len(control.shape) == 1:
             control = control.reshape(1, 1, -1)
-
+    
         if isinstance(output, tuple):
             modified = output[0]
         else:
             modified = output
-
+    
         assert len(control.shape) == len(modified.shape)
         control = control.to(modified.device)
-
+    
         norm_pre = torch.norm(modified, dim=-1, keepdim=True)
-
-        # we should ignore the padding tokens when doing the activation addition
-        # mask has ones for non padding tokens and zeros at padding tokens.
-        # only tested this on left padding
+    
         if "position_ids" in kwargs:
             pos = kwargs["position_ids"]
+    
+            # Qwen3.5-MoE (and other mrope models) pass position_ids as [3, seq_len]
+            # instead of standard [batch, seq_len]. Normalize to [batch, seq_len].
+            if pos.ndim == 2 and pos.shape[0] == 3:
+                # mrope without batch dim: [3, seq_len] → take first component → [1, seq_len]
+                pos = pos[0:1]
+            elif pos.ndim == 3:
+                # mrope with batch dim: [batch, 3, seq_len] → [batch, seq_len]
+                pos = pos[:, 0, :]
+    
             zero_indices = (pos == 0).cumsum(1).argmax(1, keepdim=True)
             seq_len = modified.shape[1]
             col_indices = torch.arange(seq_len, device=modified.device).unsqueeze(0)
@@ -183,20 +189,19 @@ class ControlModule(torch.nn.Module):
             mask = mask.to(modified.dtype).to(modified.device)
         else:
             mask = 1.0
-
+    
         modified = self.params.operator(modified, control * mask)
-
+    
         if self.params.normalize:
             norm_post = torch.norm(modified, dim=-1, keepdim=True)
             modified = modified / norm_post * norm_pre
-
+    
         if isinstance(output, tuple):
             output = (modified,) + output[1:]
         else:
             output = modified
-
+    
         return output
-
     def __getattr__(self, name: str) -> typing.Any:
         if name in ("block", "params"):
             # our properties - return normally

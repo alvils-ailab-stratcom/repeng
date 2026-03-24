@@ -172,12 +172,13 @@ class ControlModule(torch.nn.Module):
         if "position_ids" in kwargs:
             pos = kwargs["position_ids"]
             zero_indices = (pos == 0).cumsum(1).argmax(1, keepdim=True)
-            col_indices = torch.arange(pos.size(1), device=pos.device).unsqueeze(0)
+            seq_len = modified.shape[1]
+            col_indices = torch.arange(seq_len, device=modified.device).unsqueeze(0)
             target_shape = modified.shape
             mask = (
                 (col_indices >= zero_indices)
                 .float()
-                .reshape(target_shape[0], target_shape[1], 1)
+                .reshape(target_shape[0], seq_len, 1)
             )
             mask = mask.to(modified.dtype).to(modified.device)
         else:

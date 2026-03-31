@@ -177,15 +177,16 @@ class ControlModule(torch.nn.Module):
                 # mrope with batch dim: [batch, 3, seq_len] → [batch, seq_len]
                 pos = pos[0:1, 0, :]
     
-            zero_indices = (pos == 0).cumsum(1).argmax(1, keepdim=True)
+            batch_size = modified.shape[0]
             seq_len = modified.shape[1]
-            col_indices = torch.arange(seq_len, device=modified.device).unsqueeze(0)
-            target_shape = modified.shape
-            mask = (
-                (col_indices >= zero_indices)
-                .float()
-                .reshape(target_shape[0], seq_len, 1)
-            )
+            
+            # Expand pos to [batch_size, seq_len] if it was collapsed to [1, seq_len]
+            if pos.shape[0] == 1 and batch_size > 1:
+                pos = pos.expand(batch_size, -1)
+            
+            zero_indices = (pos == 0).cumsum(1).argmax(1, keepdim=True)  # [batch, 1]
+            col_indices = torch.arange(seq_len, device=modified.device).unsqueeze(0)  # [1, seq_len]
+            mask = (col_indices >= zero_indices).float().unsqueeze(-1)  # [batch, seq_len, 1]
             mask = mask.to(modified.dtype).to(modified.device)
         else:
             mask = 1.0

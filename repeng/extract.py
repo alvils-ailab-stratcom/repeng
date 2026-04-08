@@ -24,6 +24,8 @@ class DatasetEntry:
 class ControlVector:
     model_type: str
     directions: dict[int, np.ndarray]
+    positive_activations: dict[int, np.ndarray] = dataclasses.field(default_factory=dict)
+    negative_activations: dict[int, np.ndarray] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def train(
@@ -44,7 +46,7 @@ class ControlVector:
                 max_batch_size (int, optional): The maximum batch size for training.
                     Defaults to 32. Try reducing this if you're running out of memory.
                 method (str, optional): The training method to use. Can be either
-                    "pca_diff" or "pca_center". Defaults to "pca_diff".
+                    "pca_diff", "pca_center", or "diff". Defaults to "pca_diff".
                 compute_hiddens (Callable, optional): Override hidden state computation.
                     See signature of `read_representations`.
                 transform_hiddens (Callable, optional): Transform the hidden states after
@@ -54,13 +56,18 @@ class ControlVector:
             ControlVector: The trained vector.
         """
         with torch.inference_mode():
-            dirs = read_representations(
+            dirs, pos_acts, neg_acts = read_representations(
                 model,
                 tokenizer,
                 dataset,
                 **kwargs,
             )
-        return cls(model_type=model.config.model_type, directions=dirs)
+        return cls(
+            model_type=model.config.model_type,
+            directions=dirs,
+            positive_activations=pos_acts,
+            negative_activations=neg_acts,
+        )
 
     @classmethod
     def train_with_sae(
@@ -71,12 +78,11 @@ class ControlVector:
         dataset: list[DatasetEntry],
         *,
         decode: bool = True,
-        method: typing.Literal["pca_diff", "pca_center", "umap"] = "pca_center",
+        method: typing.Literal["pca_diff", "pca_center", "umap", "diff"] = "pca_center",
         **kwargs,
     ) -> "ControlVector":
         """
         Like ControlVector.train, but using an SAE. It's better! WIP.
-
 
         Args:
             model (PreTrainedModel | ControlModel): The model to train against.
@@ -90,7 +96,7 @@ class ControlVector:
                 max_batch_size (int, optional): The maximum batch size for training.
                     Defaults to 32. Try reducing this if you're running out of memory.
                 method (str, optional): The training method to use. Can be either
-                    "pca_diff" or "pca_center". Defaults to "pca_center"! This is different
+                    "pca_diff", "pca_center", or "diff". Defaults to "pca_center"! This is different
                     than ControlVector.train, which defaults to "pca_diff".
 
         Returns:
@@ -104,7 +110,7 @@ class ControlVector:
             return sae_hiddens
 
         with torch.inference_mode():
-            dirs = read_representations(
+            dirs, pos_acts, neg_acts = read_representations(
                 model,
                 tokenizer,
                 dataset,
@@ -120,7 +126,12 @@ class ControlVector:
             else:
                 final_dirs = dirs
 
-        return cls(model_type=model.config.model_type, directions=final_dirs)
+        return cls(
+            model_type=model.config.model_type,
+            directions=final_dirs,
+            positive_activations=pos_acts,
+            negative_activations=neg_acts,
+        )
 
     def export_gguf(self, path: os.PathLike[str] | str):
         """
@@ -261,14 +272,19 @@ def read_representations(
     inputs: list[DatasetEntry],
     hidden_layers: typing.Iterable[int] | None = None,
     batch_size: int = 32,
-    method: typing.Literal["pca_diff", "pca_center", "umap"] = "pca_diff",
+    method: typing.Literal["pca_diff", "pca_center", "umap", "diff"] = "pca_diff",
     compute_hiddens: ComputeHiddens | None = None,
     transform_hiddens: (
         typing.Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
     ) = None,
-) -> dict[int, np.ndarray]:
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, np.ndarray]]:
     """
     Extract the representations based on the contrast dataset.
+
+    Returns:
+        directions: dict mapping layer -> direction vector
+        positive_activations: dict mapping layer -> array of shape (n_inputs, hidden_dim)
+        negative_activations: dict mapping layer -> array of shape (n_inputs, hidden_dim)
     """
     if not hidden_layers:
         hidden_layers = range(-1, -model.config.num_hidden_layers, -1)
@@ -296,11 +312,18 @@ def read_representations(
     if transform_hiddens is not None:
         layer_hiddens = transform_hiddens(layer_hiddens)
 
-    # get directions for each layer using PCA
+    # get directions for each layer using the chosen method
     directions: dict[int, np.ndarray] = {}
+    positive_activations: dict[int, np.ndarray] = {}
+    negative_activations: dict[int, np.ndarray] = {}
+
     for layer in tqdm.tqdm(hidden_layers):
         h = layer_hiddens[layer]
         assert h.shape[0] == len(inputs) * 2
+
+        # store positive and negative activations
+        positive_activations[layer] = h[::2]
+        negative_activations[layer] = h[1::2]
 
         if method == "pca_diff":
             train = h[::2] - h[1::2]
@@ -309,16 +332,20 @@ def read_representations(
             train = h
             train[::2] -= center
             train[1::2] -= center
+        elif method == "diff":
+            directions[layer] = np.mean(h[::2] - h[1::2], axis=0).astype(np.float32)
         elif method == "umap":
             train = h
         else:
             raise ValueError("unknown method " + method)
 
-        if method != "umap":
-            # shape (1, n_features)
+        if method == "diff":
+            # direction is already set, skip PCA
+            pass
+        elif method != "umap":
             pca_model = PCA(n_components=1, whiten=False).fit(train)
-            # shape (n_features,)
             directions[layer] = pca_model.components_.astype(np.float32).squeeze(axis=0)
+            print(f"layer {layer}: variance explained = {pca_model.explained_variance_ratio_[0]:.3f}")
         else:
             # still experimental so don't want to add this as a real dependency yet
             import umap  # type: ignore
@@ -327,27 +354,28 @@ def read_representations(
             embedding = umap_model.fit_transform(train).astype(np.float32)
             directions[layer] = np.sum(train * embedding, axis=0) / np.sum(embedding)
 
-        # calculate sign
-        projected_hiddens = project_onto_direction(h, directions[layer])
+        if method != "diff":
+            # calculate sign
+            projected_hiddens = project_onto_direction(h, directions[layer])
 
-        # order is [positive, negative, positive, negative, ...]
-        positive_smaller_mean = np.mean(
-            [
-                projected_hiddens[i] < projected_hiddens[i + 1]
-                for i in range(0, len(inputs) * 2, 2)
-            ]
-        )
-        positive_larger_mean = np.mean(
-            [
-                projected_hiddens[i] > projected_hiddens[i + 1]
-                for i in range(0, len(inputs) * 2, 2)
-            ]
-        )
+            # order is [positive, negative, positive, negative, ...]
+            positive_smaller_mean = np.mean(
+                [
+                    projected_hiddens[i] < projected_hiddens[i + 1]
+                    for i in range(0, len(inputs) * 2, 2)
+                ]
+            )
+            positive_larger_mean = np.mean(
+                [
+                    projected_hiddens[i] > projected_hiddens[i + 1]
+                    for i in range(0, len(inputs) * 2, 2)
+                ]
+            )
 
-        if positive_smaller_mean > positive_larger_mean:  # type: ignore
-            directions[layer] *= -1
+            if positive_smaller_mean > positive_larger_mean:  # type: ignore
+                directions[layer] *= -1
 
-    return directions
+    return directions, positive_activations, negative_activations
 
 
 def batched_get_hiddens(
